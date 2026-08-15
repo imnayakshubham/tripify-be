@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 
 from app.api.deps import current_user, require_admin
-from app.configs import GROQ_MODEL_NAME
+from app.configs import MODEL_NAME
 from app.db import audit
 from app.db.metrics import collect_metrics
 from app.graph import selected_agents_in_order, travel_graph
@@ -62,7 +62,7 @@ def create_plan(
         plan_id=plan_id,
         user_id=user.id,
         user_query=request.user_query,
-        model_name=GROQ_MODEL_NAME,
+        model_name=MODEL_NAME,
     )
 
     started = time.monotonic()
@@ -174,7 +174,7 @@ def create_plan_stream(
         plan_id=plan_id,
         user_id=user.id,
         user_query=request.user_query,
-        model_name=GROQ_MODEL_NAME,
+        model_name=MODEL_NAME,
     )
 
     def event_stream() -> Iterator[str]:

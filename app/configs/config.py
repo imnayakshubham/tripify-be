@@ -11,7 +11,7 @@ IS_PROD = ENV == "PROD"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-GROQ_MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 ALLOWED_CORS_ORIGINS = [
     origin.strip()
