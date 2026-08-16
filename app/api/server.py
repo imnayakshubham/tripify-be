@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
 from app.configs import ALLOWED_CORS_ORIGINS, ENV, IS_PROD
 from app.db import close_pool, run_migrations
+from scripts.keepalive import start_keepalive, stop_keepalive
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,12 @@ async def lifespan(_: FastAPI):
             "Set it to the deployed frontend's origin."
         )
 
-    yield
-    close_pool()
+    scheduler = start_keepalive()
+    try:
+        yield
+    finally:
+        stop_keepalive(scheduler)
+        close_pool()
 
 
 api_app = FastAPI(
