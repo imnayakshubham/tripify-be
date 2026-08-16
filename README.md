@@ -2,8 +2,16 @@
 
 You send something like *"a five day trip somewhere warm in Europe for under 1500 pounds"* and get back one plan. Behind it are three agents — destination, itinerary and budget — that run in order, each building on what the last produced. The response names the agents that contributed, and every run is written to an audit trail.
 
-FastAPI + LangGraph + Postgres. The React frontend lives in its own repository:
-`https://github.com/YOUR-USER/trip-planner-frontend` <!-- TODO: real URL -->
+**Live app: [tripify-fe.vercel.app](https://tripify-fe.vercel.app)**  ·  API: [tripify-be.onrender.com](https://tripify-be.onrender.com)
+
+FastAPI + LangGraph + Postgres, with a React 18 + TypeScript frontend in its own repository.
+
+| | Repository |
+| --- | --- |
+| Backend (this repo) | [imnayakshubham/tripify-be](https://github.com/imnayakshubham/tripify-be) |
+| Frontend | [imnayakshubham/tripify-fe](https://github.com/imnayakshubham/tripify-fe) |
+
+The API is on Render's free tier, which sleeps after 15 minutes idle. `scripts/keepalive.py` pings `/health` every 14 minutes so the first request isn't a 50-second cold start.
 
 ---
 
@@ -208,3 +216,71 @@ app/
   configs/      env values only
   llms/         chat-model factory
 ```
+
+---
+
+## Decision note
+
+### 1. A supervisor picks, then a fixed order
+
+I could have let the agents hand off to each other and decide when to stop. I did not, because the order is not up for debate. You cannot build an itinerary without a destination, or cost one that does not exist yet.
+
+So the supervisor has one job: deciding which agents a request needs. The order is fixed in code, and routing walks to the next selected agent, then falls through to synthesis. If you name a destination yourself, that agent is skipped and the itinerary agent goes first, so there are fewer model calls and less to go wrong. It also stays easy to debug, because routing is a plain function I can read, not something emerging from five prompts.
+
+State is a LangGraph `TypedDict` where only `messages` and `contributing_agents` build up. Everything else is last write wins, which lets the destination agent write its choice into `trip_constraints` for later agents to read.
+
+### 2. Rules in code where possible
+
+The brief says the agents "must never" do certain things. A line in a prompt is not a guarantee, so wherever a rule can be checked in code, I check it. The destination agent throws away any candidate the model itself flagged as breaking a hard constraint, picks from what is left, and picks again if its own recommendation did not survive. This really does happen. The budget agent works out `within_budget` from the numbers instead of trusting the model's flag, and writes the overage warning itself when one is missing.
+
+The itinerary rule, flagging uncertain timings, cannot be checked in code, so it lives in the prompt. I would rather be clear about which is which than imply all three are enforced.
+
+### 3. Attribution and audit from one place
+
+The `@audited` decorator times each agent, writes its audit row, records the real token counts, and adds the agent to `contributing_agents`. Because it is one decorator, what the user sees and what the log says cannot drift apart. It also absorbs failures. A failed agent is recorded, labelled `(failed)`, and the chain carries on instead of a 500.
+
+### What I cut
+
+Tests. Real auth. Visual polish. And `GET /plans/{id}` returns the audit record rather than the plan text, so you cannot open an old plan from history. I flagged that in the UI instead of faking a detail page.
+
+---
+
+## Production architecture note
+
+Running this on Azure for 500 or more concurrent users. The frontend stays on Vercel.
+
+Proposed, not the current deployment:
+
+```mermaid
+flowchart TD
+    B[Browser<br/>React app on Vercel] --> ACA[Container Apps<br/>scales on concurrent requests]
+    ACA --> A1[API replica]
+    ACA --> A2[API replica]
+    ACA --> A3[API replica]
+    A1 & A2 & A3 --> PG[(Postgres Flexible Server<br/>PgBouncer)]
+    A1 & A2 & A3 --> GROQ[Groq API]
+    A1 & A2 & A3 --> KV[Key Vault]
+    A1 & A2 & A3 -.OTel.-> AI[Application Insights]
+```
+
+### Provisioning
+
+Bicep, deployed from GitHub Actions with OIDC, so environments are reproducible.
+
+Azure Container Apps for the FastAPI backend, because it can scale on concurrent HTTP requests. The work here is waiting on the model, not CPU. Azure Database for PostgreSQL Flexible Server, using its built in PgBouncer. Key Vault for secrets, read with a managed identity.
+
+### Getting to 500 concurrent users
+
+Each request holds a worker thread for the whole chain, ten to sixty seconds of blocking calls, so replicas are the scaling unit. I would set the concurrent request target per replica from a load test, and cap max replicas above the measured peak.
+
+Two limits would show up before compute does. The model provider's rate limit, and the 240 second default cap Container Apps puts on a request, which matters because `/plans/stream` holds the connection open for the whole run. Front Door does not support server sent events, so it would not sit in front of the API.
+
+### Authentication and access control
+
+Identity today is an `X-User-Email` header the server believes. That is a stub, not security. It would be replaced with whatever identity provider is already in use, validating a signed token instead of a header.
+
+What carries over is structural. Roles live on the user row, the role check sits in one dependency, and non admin scoping is a SQL where clause rather than filtering after the fact.
+
+### Monitoring
+
+OpenTelemetry into Application Insights, a trace per request with a span per agent. The audit tables already record duration and tokens per agent, so cost reporting could come from Postgres. Alerts on agent failure rate, p95 latency and spend per tenant.
