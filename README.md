@@ -42,15 +42,74 @@ Two things that will cost you ten minutes if you hit them cold:
 
 A supervisor reads the request and decides which specialists it actually needs. If a destination was named, the destination agent is skipped. Whatever it picks runs in a fixed order, because the dependencies are real: you cannot plan days without a destination, and you cannot cost a plan that does not exist yet.
 
-```text
-START → supervisor → [destination] → [itinerary] → [budget] → synthesis → END
+```mermaid
+flowchart TD
+    START([START]) --> SUP[supervisor]
+    SUP -->|route_from_supervisor| DEST[destination_agent]
+    SUP -.->|destination already named| ITIN[itinerary_agent]
+    SUP -.->|cost-only question| BUD[budget_agent]
+    DEST -->|route_after_agent| ITIN
+    DEST -.-> BUD
+    ITIN -->|route_after_agent| BUD
+    ITIN -.-> SYN
+    BUD -->|route_after_agent| SYN[synthesis]
+    SYN --> END([END])
 ```
 
-Anything in brackets is optional. Synthesis always runs and writes the final answer.
+Solid edges are the full chain; dotted edges are the skips a conditional edge can take when the supervisor did not select an agent. Synthesis always runs and writes the final answer.
 
-Routing lives in `app/graph.py`: `route_after_agent` walks `AGENT_ORDER` to the next selected agent and falls through to synthesis. It is a pure function, which is what makes the chain debuggable rather than emergent.
+The whole graph is five nodes and two static edges — `START → supervisor` and `synthesis → END`. Everything between them is conditional.
 
-If an agent fails, the run does not die. It is recorded as failed, labelled `"<name> (failed)"` in the attribution, and the chain continues — synthesis is told what is missing rather than the API returning a 500.
+### One request, end to end
+
+**The API seeds the state.** `POST /plans` mints a `plan_id` and invokes the graph with `messages`, `plan_id`, `user_id` and `user_query`. That `plan_id` is also the LangGraph thread id — see [Re-opening a plan](#re-opening-a-plan) for why that matters.
+
+**The supervisor makes the only routing decision** (`app/agents/supervisor.py`). It asks the model once for a selection plus the extracted constraints, then does three things to what comes back — two of them defensive:
+
+1. Filters the picks against `KNOWN_AGENTS`, so an invented agent name is dropped rather than routed to.
+2. Falls back to `["itinerary_agent"]` if nothing survives. An empty selection would leave synthesis with nothing to work from.
+3. Appends `budget_agent` whenever `to_number(trip_constraints["budget_amount"])` parses. The model is free to return a budget while omitting the agent that checks it — well-formed, but contradictory, and a budget that is never checked is the worst version of "silently exceeded". This is a routing override, not just a prompt rule.
+
+**Routing walks the chain** (`app/graph.py`). `route_from_supervisor` returns the first of `selected_agents_in_order(state)`, or `"synthesis"` if the list is empty. After each specialist, `route_after_agent(name)` scans `AGENT_ORDER` **forward only** — `AGENT_ORDER[current_position + 1:]` — for the next selected agent, and falls through to synthesis when there isn't one. All four conditional edges share one path map, `ROUTE_MAP`.
+
+Two things follow from "forward only": the graph cannot loop, and skipping needs no special case — an unselected agent is simply never a routing target. `selected_agents_in_order` re-sorts the supervisor's list into `AGENT_ORDER`, which is why appending `budget_agent` in step 3 above cannot break sequencing.
+
+These routers are pure functions of state. That is what makes the chain debuggable rather than emergent — you can read the path a request will take without running a model.
+
+**Synthesis writes the answer** (`app/agents/synthesis.py`). It reads `destination_results`, `itinerary` and `budget_results` — the markdown strings only, never the structured dicts — and names the agents that contributed. A *successful* supervisor is excluded from that list, because orchestration is not a knowledge contribution; a *failed* one is still reported, because it means no specialist ran at all.
+
+### How state moves between agents
+
+`TravelState` (`app/schema/state.py`) is a LangGraph `TypedDict`. Only two fields accumulate — `messages` and `contributing_agents`, both `Annotated[..., operator.add]`. **Everything else is last-write-wins**, and that is the mechanism the chain runs on rather than an incidental detail: the destination agent returns `{**trip_constraints, "destination": recommended}`, replacing the dict wholesale, so itinerary and budget just read the resolved destination out of the state they were handed.
+
+Each specialist writes two keys — the structure it produced, and a markdown rendering of it:
+
+| Agent | Structured | Markdown | Also writes |
+| --- | --- | --- | --- |
+| `destination_agent` | `destination_choice` | `destination_results` | `trip_constraints` (overwritten) |
+| `itinerary_agent` | `itinerary_plan` | `itinerary` | |
+| `budget_agent` | `budget_assessment` | `budget_results` | |
+
+The markdown is a view of the structure, not the source. Synthesis consumes the markdown; the React UI consumes the structure. An agent that stopped emitting its markdown would silently degrade the final answer, which is why the `_format()` helpers are load-bearing rather than cosmetic.
+
+### When an agent fails
+
+The run does not die. `@audited` in `app/agents/base.py` wraps every node: it catches the exception, records the invocation as `failed`, returns an empty delta, and appends `"<name> (failed)"` to `contributing_agents`.
+
+Because that list accumulates, one string is the single source for two consumers — synthesis reads it to tell the model which sections are missing, and `_agent_status` in the streaming route reads it to set the SSE status. Neither invents an outcome, so what the user sees, what the stream reports, and what the audit log says cannot drift apart.
+
+### Adding a fourth agent
+
+Sequential by design, but not closed. A new specialist means touching:
+
+- `app/agents/<name>.py` and `app/agents/__init__.py`
+- `app/prompts/<name>.py`
+- `AGENT_ORDER`, `ROUTE_MAP` and a node registration in `app/graph.py`
+- `AGENT_SEQUENCE` in `app/agents/base.py`
+- the agent list in the supervisor prompt
+- the output keys in `TravelState`
+
+Nothing else — routing picks it up from `AGENT_ORDER` automatically.
 
 ## Where the behavioural rules are enforced
 
