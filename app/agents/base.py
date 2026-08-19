@@ -46,13 +46,23 @@ def ask_llm(system_message: str, user_prompt: str) -> str:
         ]
     )
 
+    # Measured counts from the provider, not an estimate.
+    metadata = getattr(response, "usage_metadata", None) or {}
+
     usage = _usage.get(None)
     if usage is not None:
-        # Measured counts from the provider, not an estimate.
-        metadata = getattr(response, "usage_metadata", None) or {}
         usage["llm_calls"] += 1
         usage["input_tokens"] += metadata.get("input_tokens", 0)
         usage["output_tokens"] += metadata.get("output_tokens", 0)
+
+    # "length" means the provider stopped us at the completion ceiling rather than at a
+    # natural end, so the reply is cut off mid-token. Read the real ceiling off this
+    # line when sizing MAX_OUTPUT_TOKENS.
+    if (getattr(response, "response_metadata", None) or {}).get("finish_reason") == "length":
+        logger.warning(
+            "LLM reply hit the completion ceiling after %s output tokens.",
+            metadata.get("output_tokens"),
+        )
 
     return response.content
 

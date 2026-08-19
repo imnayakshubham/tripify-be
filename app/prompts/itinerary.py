@@ -63,6 +63,8 @@ Rules you must follow:
 4. Do not invent precise prices, timetables, or booking details.
 5. "category" must be exactly one of: {", ".join(CATEGORIES)}.
 6. "part_of_day" must be exactly one of: morning, afternoon, evening.
+7. At most three segments per day, one sentence each. A reply that runs long gets cut
+   off by the token ceiling and loses its final days entirely.
 
 Return only JSON with this schema:
 {{
