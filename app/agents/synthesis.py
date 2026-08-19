@@ -11,11 +11,8 @@ from app.schema import TravelState
 def synthesis_agent(state: TravelState):
     contributed = state.get("contributing_agents", []) or []
 
-    # A successful supervisor is orchestration, not a knowledge contribution, so
-    # it is not named as a source. A *failed* one must still be reported: it
-    # means no specialist ran at all, and matching on the "supervisor" prefix
-    # used to drop "supervisor (failed)" into neither list, so the answer was
-    # assembled from three empty sections with no sign anything had broken.
+    # A successful supervisor is orchestration, not a source. A failed one must still
+    # be reported — it means no specialist ran at all.
     failed = [
         name.removesuffix(" (failed)") for name in contributed if name.endswith("(failed)")
     ]

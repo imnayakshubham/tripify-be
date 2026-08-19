@@ -1,14 +1,7 @@
-"""Caller identity — a deliberate stub, NOT a security boundary.
+"""Auth stub, not a security boundary.
 
-Identity is asserted by an `X-User-Email` header and believed. There are no
-passwords, tokens, sessions, or signature checks, so anyone who can set a header
-can claim any identity, including admin. That is on purpose: the brief defers
-authentication and access control to the live round and explicitly asks not to
-build enterprise identity here.
-
-What is real is the *shape*: roles live in the database on the user row, not in
-the request, and role checks happen in one place. Swapping this for real auth
-means replacing `current_user` and nothing else.
+Identity is asserted by header and believed — anyone who can set a header can claim
+admin. Real auth replaces `current_user` and nothing else.
 """
 
 from fastapi import Depends, Header, HTTPException
@@ -23,7 +16,7 @@ def current_user(
     x_user_email: str = Header(default=DEFAULT_EMAIL),
     x_user_role: str | None = Header(default=None),
 ) -> CurrentUser:
-    """Resolve (and on first sight create) the caller's user row."""
+    """Resolve, and on first sight create, the caller's user row."""
     row = audit.upsert_user(email=x_user_email, role=x_user_role)
 
     if row["status"] != "active":

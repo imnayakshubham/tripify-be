@@ -1,8 +1,7 @@
 """Budget agent prompt.
 
-Behavioural constraint from the brief: must never silently exceed the budget. It
-flags the overage and proposes a cheaper alternative. The output is structured so
-the agent can verify that in code — a prompt instruction alone is not a guarantee.
+Structured output so app/agents/budget.py can verify the verdict in code; a prompt
+instruction alone is not a guarantee.
 """
 
 from typing import Any

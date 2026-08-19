@@ -1,18 +1,13 @@
 """Itinerary agent prompt.
 
-Behavioural constraint from the brief: each day must be realistic on travel time
-and sequencing, and it must say so when it is uncertain.
-
-The output is structured rather than free prose so the UI can render a real
-day-by-day plan. Note what that does to the uncertainty rule: instead of asking
-for the words "Uncertain: ..." somewhere in a paragraph, uncertainty gets its own
-field per segment. The obligation is unchanged; it is just addressable now.
+Uncertainty gets its own field per segment rather than a phrase buried in prose, so
+the doubt is addressable data.
 """
 
 from typing import Any
 
-# The closed set the UI colour-codes by. Free-form categories would produce an
-# unbounded palette, so the prompt is told to pick from these and nothing else.
+# Closed set — the UI colour-codes by these, and free-form values would need an
+# unbounded palette.
 CATEGORIES = (
     "transport",
     "food",

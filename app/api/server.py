@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.configs import ALLOWED_CORS_ORIGINS, ENV, IS_PROD
-from app.db import close_pool, run_migrations
+from app.db import dispose_engine, run_migrations
 from scripts.keepalive import start_keepalive, stop_keepalive
 
 logger = logging.getLogger(__name__)
@@ -14,15 +14,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Idempotent, so it is safe on every boot.
     run_migrations()
 
     logger.info("Starting in %s, allowing origins: %s", ENV, ALLOWED_CORS_ORIGINS or "(none)")
 
-    if IS_PROD and not ALLOWED_CORS_ORIGINS:
+    if not ALLOWED_CORS_ORIGINS:
         logger.warning(
-            "CORS_ORIGINS is not set and ENV=PROD, so no browser origin is allowed. "
-            "Set it to the deployed frontend's origin."
+            "CORS_ORIGINS is not set, so no browser origin is allowed and every "
+            "request will fail preflight. Set it in .env — see .env.example."
         )
 
     scheduler = start_keepalive()
@@ -30,7 +29,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         stop_keepalive(scheduler)
-        close_pool()
+        dispose_engine()
 
 
 api_app = FastAPI(

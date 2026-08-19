@@ -30,6 +30,12 @@ class CreatePlanRequest(BaseModel):
         description="The trip request in plain language.",
         examples=["a five day trip somewhere warm in Europe for under 1500 pounds"],
     )
+    # Continuing a plan means resuming its LangGraph thread, which is why this is the
+    # plan id and not a separate conversation id — they are the same thing.
+    plan_id: UUID | None = Field(
+        default=None,
+        description="Continue this plan instead of starting a new one.",
+    )
 
 
 class AgentContribution(BaseModel):
@@ -52,12 +58,9 @@ class PlanResponse(BaseModel):
     budget_results: str = ""
     trip_constraints: dict[str, Any] = {}
 
-    # What the agents actually decided, before it was flattened into markdown.
-    # Typed as plain dicts on purpose: this is unvalidated model output, where a
-    # cost may arrive as "£1,200" or 1200 and any key may be missing. Strict
-    # models here would turn a model quirk into a 500 on an otherwise good run,
-    # so the shape is enforced in the TypeScript client instead, where getting
-    # it wrong is a compile error rather than a failed request.
+    # Plain dicts on purpose: unvalidated model output, where a cost may arrive as
+    # "£1,200" or 1200 and any key may be missing. Strict models would turn a model
+    # quirk into a 500; the shape is enforced in the TypeScript client instead.
     destination_choice: dict[str, Any] | None = None
     itinerary_plan: dict[str, Any] | None = None
     budget_assessment: dict[str, Any] | None = None

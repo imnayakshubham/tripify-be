@@ -1,24 +1,4 @@
-"""Budget agent.
-
-Brief: "It must never silently exceed the budget. It flags the overage and
-proposes a cheaper alternative."
-
-"Never" is not something a prompt guarantees, so the checks are in code, and they
-fail *closed*: anything this module cannot verify is reported as unverified
-rather than passed as fine.
-
-Three things are enforced here rather than asked for:
-
-1. The comparison is anchored on the budget the *user* stated. The model echoes
-   a budget back and that echo can drift upward; trusting it would turn a real
-   overage into a verified-looking pass, which is worse than no check at all.
-2. `within_budget` is recomputed, and deleted outright when it cannot be
-   recomputed. A figure that will not parse, or a currency mismatch, yields None
-   ("could not verify") — never True.
-3. The cheaper alternative is checked against the shortfall. The brief asks the
-   agent to propose one; a proposal that does not actually close the gap is
-   reported as insufficient instead of presented as the solution.
-"""
+"""Budget agent. The verdict is recomputed in `_verify` and fails closed."""
 
 from langchain_core.messages import AIMessage
 
@@ -31,10 +11,6 @@ from app.agents.base import (
 )
 from app.prompts.budget import SYSTEM, budget_prompt
 from app.schema import TravelState
-
-# Local alias: this module reads as arithmetic, and `_number` is what the
-# formatting helpers below have always called it.
-_number = to_number
 
 
 @audited("budget_agent")
@@ -64,40 +40,37 @@ def budget_agent(state: TravelState):
 
 def _verify(assessment: dict, trip_constraints: dict) -> None:
     """Recompute the verdict in place. Fails closed."""
-    estimated_total = _number(assessment.get("estimated_total"))
+    estimated_total = to_number(assessment.get("estimated_total"))
 
-    # The user's stated budget wins. The model's is only a fallback for when the
-    # user never gave one — never an override of one they did.
-    stated_budget = _number(trip_constraints.get("budget_amount"))
+    # The user's figure wins; the model's echo is only a fallback, never an override.
+    stated_budget = to_number(trip_constraints.get("budget_amount"))
     budget_amount = (
-        stated_budget if stated_budget is not None else _number(assessment.get("budget_amount"))
+        stated_budget if stated_budget is not None else to_number(assessment.get("budget_amount"))
     )
 
-    # Carry the resolved figure so downstream readers compare against the same
-    # number this verdict used, instead of the model's version or nothing.
+    # Carry the resolved figure so the client compares against the number this verdict used.
     if budget_amount is not None:
         assessment["budget_amount"] = budget_amount
 
     if budget_amount is None:
-        # No budget anywhere: there is nothing to exceed, so there is no claim
-        # to make. Drop the model's flag rather than let it assert one.
+        # Nothing to exceed, so make no claim — and leave no reason behind either.
         assessment.pop("within_budget", None)
         assessment.pop("overage_amount", None)
+        assessment.pop("unverified_reason", None)
         return
 
-    # Comparing bare floats across currencies is meaningless. But only flag a
-    # mismatch when both sides are *recognised and different*: the supervisor
-    # extracts the user's wording ("pounds") while this agent returns a code
-    # ("GBP"), and treating that as a mismatch reported a real overage as
-    # unverifiable — hiding exactly what this check exists to surface.
+    # Only flag a mismatch when both sides are recognised and different —
+    # unknown must never mean different.
     stated_currency = normalise_currency(trip_constraints.get("budget_currency"))
     quoted_currency = normalise_currency(assessment.get("currency"))
-    currency_mismatch = bool(
-        stated_currency and quoted_currency and stated_currency != quoted_currency
+    currency_mismatch = (
+        stated_currency is not None
+        and quoted_currency is not None
+        and stated_currency != quoted_currency
     )
 
     if estimated_total is None or currency_mismatch:
-        # Unverifiable. None is a third state, distinct from "within budget".
+        # None is a third state, distinct from "within budget".
         assessment["within_budget"] = None
         assessment["overage_amount"] = None
         assessment["unverified_reason"] = (
@@ -119,8 +92,7 @@ def _verify_alternative(assessment: dict, estimated_total: float, budget_amount:
     """Check the proposed alternative actually brings the trip within budget."""
     alternative = assessment.get("cheaper_alternative")
 
-    # Accept the older plain-string shape so a model that ignores the schema
-    # still produces something usable — just unverifiable.
+    # Accept the older plain-string shape, just unverifiable.
     if isinstance(alternative, str):
         alternative = {"description": alternative.strip()} if alternative.strip() else None
         assessment["cheaper_alternative"] = alternative
@@ -129,11 +101,11 @@ def _verify_alternative(assessment: dict, estimated_total: float, budget_amount:
         assessment["alternative_closes_gap"] = None
         return
 
-    saving = _number(alternative.get("estimated_saving"))
+    saving = to_number(alternative.get("estimated_saving"))
     if saving is None:
         # Fall back to summing the itemised changes.
         changes = alternative.get("changes") or []
-        savings = [_number(change.get("saving")) for change in changes if isinstance(change, dict)]
+        savings = [to_number(change.get("saving")) for change in changes if isinstance(change, dict)]
         known = [value for value in savings if value is not None]
         saving = sum(known) if known else None
 
@@ -173,12 +145,10 @@ def _format(assessment: dict) -> str:
         lines.append(f"⚠️ **Over budget by {currency} {overage}.**")
         lines.extend(_alternative_lines(assessment, alternative, currency))
     elif within_budget is True:
-        headroom = _number(budget)
-        spent = _number(total)
-        if headroom is not None and spent is not None:
-            lines.append(
-                f"\n✅ Within budget, with {currency} {round(headroom - spent, 2)} of headroom."
-            )
+        # budget is already a float from _verify; estimated_total is not.
+        spent = to_number(total)
+        if spent is not None:
+            lines.append(f"\n✅ Within budget, with {currency} {round(budget - spent, 2)} of headroom.")
         else:
             lines.append("\n✅ Within budget.")
 
@@ -199,10 +169,8 @@ def _format(assessment: dict) -> str:
 
 
 def _alternative_lines(assessment: dict, alternative, currency: str) -> list[str]:
-    """The overage is never reported without an alternative, or without saying
-    the alternative is missing or insufficient."""
+    """An overage is never reported without an alternative, or without saying it is missing."""
     if not isinstance(alternative, dict) or not alternative.get("description"):
-        # The constraint is enforced here, not left to the model.
         return [
             "\n**Cheaper alternative:** none was produced. Treat this plan as "
             "unaffordable as specified — reduce the trip length, move to a "
@@ -214,7 +182,7 @@ def _alternative_lines(assessment: dict, alternative, currency: str) -> list[str
     for change in alternative.get("changes") or []:
         if not isinstance(change, dict):
             continue
-        saving = _number(change.get("saving"))
+        saving = to_number(change.get("saving"))
         suffix = f" (saves {currency} {saving})" if saving is not None else ""
         lines.append(f"- {change.get('change', '')}{suffix}")
 
@@ -224,7 +192,7 @@ def _alternative_lines(assessment: dict, alternative, currency: str) -> list[str
     if closes_gap is True:
         lines.append(f"\nThat would bring the trip to about {currency} {resulting} — within budget.")
     elif closes_gap is False:
-        still_over = round(resulting - _number(assessment.get("budget_amount")), 2)
+        still_over = round(resulting - assessment["budget_amount"], 2)
         lines.append(
             f"\n⚠️ Even with this change the trip is about {currency} {resulting}, "
             f"still {currency} {still_over} over. It does not bring the trip within budget."

@@ -1,11 +1,7 @@
 """Keep the Render deployment awake.
 
-Render's free tier suspends a service after 15 minutes without inbound traffic and
-then charges a 50s+ cold start on the next request. Pinging /health every 14 minutes
-keeps it under that threshold.
-
-Off in dev unless KEEPALIVE_ENABLED says otherwise — a laptop has no business keeping
-the deployment awake.
+Render's free tier suspends after 15 minutes without traffic, then costs a 50s+ cold
+start. Off in dev unless KEEPALIVE_ENABLED says otherwise.
 """
 
 import logging
@@ -14,6 +10,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from app.configs import IS_PROD
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +24,7 @@ INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL_SECONDS", "840"))
 
 _enabled = os.getenv("KEEPALIVE_ENABLED")
 ENABLED = (
-    _enabled.strip().lower() in {"1", "true", "yes", "on"}
-    if _enabled is not None
-    else os.getenv("ENV", "DEV").strip().upper() == "PROD"
+    _enabled.strip().lower() in {"1", "true", "yes", "on"} if _enabled is not None else IS_PROD
 )
 
 
@@ -43,7 +39,7 @@ def ping() -> None:
 
 def start_keepalive() -> BackgroundScheduler | None:
     if not ENABLED:
-        logger.info("Keepalive disabled (ENV=%s)", os.getenv("ENV", "DEV"))
+        logger.info("Keepalive disabled")
         return None
 
     scheduler = BackgroundScheduler()

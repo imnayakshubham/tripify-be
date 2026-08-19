@@ -1,22 +1,27 @@
 """Audit trail: who asked what, and which agents handled it.
 
-Every write here is best-effort. A failure to log must never break a user's
-request, so the public functions swallow and report their own errors.
+The logging writes swallow their own errors — a failure to log must never break a
+user's request. `upsert_user` and the reads do not: failing quietly there would serve
+a request as an unknown user, or show an empty log as though nothing had happened.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 
-from app.db.pool import get_pool
+from sqlalchemy import Text, cast, func, literal, select, update
+from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, insert
+
+from app.db.engine import session_scope
+from app.db.models import AgentInvocation, PlanRequest, User
 
 logger = logging.getLogger(__name__)
 
-# Agent output is truncated before storage; the checkpoint tables hold the
-# full text under the same id.
+# Agent output is truncated before storage; the checkpoint tables hold the full text
+# under the same id.
 OUTPUT_SUMMARY_LIMIT = 2000
 
 
@@ -25,38 +30,25 @@ OUTPUT_SUMMARY_LIMIT = 2000
 def upsert_user(email: str, role: str | None = None) -> dict[str, Any]:
     """Find or create the user for this email, returning the row.
 
-    Part of the auth *stub* — see app/api/deps.py. Identity is asserted by a
-    header, not proven.
+    Part of the auth stub — `X-User-Role` is written straight onto the row, so a
+    caller can promote itself. One statement, not SELECT-then-INSERT: that raced two
+    concurrent first requests for the same email into users_email_lower_idx.
     """
-    with get_pool().connection() as connection:
-        existing = connection.execute(
-            "SELECT * FROM users WHERE lower(email) = lower(%s)",
-            (email,),
-        ).fetchone()
+    values = {"email": email, "display_name": email.split("@")[0], "role": role or "user"}
 
-        if existing is None:
-            return connection.execute(
-                """
-                INSERT INTO users (email, display_name, role)
-                VALUES (%s, %s, COALESCE(%s, 'user'))
-                RETURNING *
-                """,
-                (email, email.split("@")[0], role),
-            ).fetchone()
+    updates: dict[str, Any] = {"last_login_at": func.now()}
+    if role:
+        updates["role"] = role
 
-        # A role passed on the request seeds the stub, but never demotes an
-        # existing admin silently.
-        if role and role != existing["role"]:
-            return connection.execute(
-                "UPDATE users SET role = %s WHERE id = %s RETURNING *",
-                (role, existing["id"]),
-            ).fetchone()
+    statement = (
+        insert(User)
+        .values(**values)
+        .on_conflict_do_update(index_elements=[func.lower(User.email)], set_=updates)
+        .returning(*User.__table__.c)
+    )
 
-        connection.execute(
-            "UPDATE users SET last_login_at = now() WHERE id = %s",
-            (existing["id"],),
-        )
-        return existing
+    with session_scope() as session:
+        return dict(session.execute(statement).mappings().one())
 
 
 # -------------------------------------------------------- plan requests
@@ -69,13 +61,16 @@ def start_request(
     source: str = "web",
 ) -> None:
     try:
-        with get_pool().connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO plan_requests (id, user_id, user_query, status, model_name, source)
-                VALUES (%s, %s, %s, 'running', %s, %s)
-                """,
-                (plan_id, user_id, user_query, model_name, source),
+        with session_scope() as session:
+            session.execute(
+                insert(PlanRequest).values(
+                    id=plan_id,
+                    user_id=user_id,
+                    user_query=user_query,
+                    status="running",
+                    model_name=model_name,
+                    source=source,
+                )
             )
     except Exception:
         logger.exception("Failed to record start of plan %s", plan_id)
@@ -89,36 +84,29 @@ def finish_request(
     duration_ms: int | None = None,
 ) -> None:
     """Close the request and roll up cost from its agent invocations."""
+
+    def rollup(column):
+        return (
+            select(func.coalesce(func.sum(column), 0))
+            .where(AgentInvocation.request_id == plan_id)
+            .scalar_subquery()
+        )
+
     try:
-        with get_pool().connection() as connection:
-            connection.execute(
-                """
-                UPDATE plan_requests AS request
-                SET status           = %s,
-                    trip_constraints = %s,
-                    error_message    = %s,
-                    duration_ms      = %s,
-                    completed_at     = now(),
-                    llm_calls     = COALESCE(rollup.llm_calls, 0),
-                    input_tokens  = COALESCE(rollup.input_tokens, 0),
-                    output_tokens = COALESCE(rollup.output_tokens, 0)
-                FROM (
-                    SELECT SUM(llm_calls)     AS llm_calls,
-                           SUM(input_tokens)  AS input_tokens,
-                           SUM(output_tokens) AS output_tokens
-                    FROM agent_invocations
-                    WHERE request_id = %s
-                ) AS rollup
-                WHERE request.id = %s
-                """,
-                (
-                    status,
-                    json.dumps(trip_constraints) if trip_constraints is not None else None,
-                    error_message,
-                    duration_ms,
-                    plan_id,
-                    plan_id,
-                ),
+        with session_scope() as session:
+            session.execute(
+                update(PlanRequest)
+                .where(PlanRequest.id == plan_id)
+                .values(
+                    status=status,
+                    trip_constraints=trip_constraints,
+                    error_message=error_message,
+                    duration_ms=duration_ms,
+                    completed_at=func.now(),
+                    llm_calls=rollup(AgentInvocation.llm_calls),
+                    input_tokens=rollup(AgentInvocation.input_tokens),
+                    output_tokens=rollup(AgentInvocation.output_tokens),
+                )
             )
     except Exception:
         logger.exception("Failed to record completion of plan %s", plan_id)
@@ -131,8 +119,8 @@ def record_agent_invocation(
     agent_name: str,
     sequence_index: int,
     status: str,
-    started_at,
-    finished_at,
+    started_at: datetime,
+    finished_at: datetime,
     duration_ms: int,
     llm_calls: int = 0,
     input_tokens: int = 0,
@@ -141,30 +129,22 @@ def record_agent_invocation(
     error_message: str | None = None,
 ) -> None:
     try:
-        with get_pool().connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO agent_invocations (
-                    request_id, agent_name, sequence_index, status, error_message,
-                    llm_calls, input_tokens, output_tokens, duration_ms,
-                    output_summary, started_at, finished_at
+        with session_scope() as session:
+            session.execute(
+                insert(AgentInvocation).values(
+                    request_id=plan_id,
+                    agent_name=agent_name,
+                    sequence_index=sequence_index,
+                    status=status,
+                    error_message=error_message,
+                    llm_calls=llm_calls,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    duration_ms=duration_ms,
+                    output_summary=(output_summary or "")[:OUTPUT_SUMMARY_LIMIT] or None,
+                    started_at=started_at,
+                    finished_at=finished_at,
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    plan_id,
-                    agent_name,
-                    sequence_index,
-                    status,
-                    error_message,
-                    llm_calls,
-                    input_tokens,
-                    output_tokens,
-                    duration_ms,
-                    (output_summary or "")[:OUTPUT_SUMMARY_LIMIT] or None,
-                    started_at,
-                    finished_at,
-                ),
             )
     except Exception:
         logger.exception("Failed to record %s for plan %s", agent_name, plan_id)
@@ -178,91 +158,106 @@ def list_requests(
 ) -> list[dict[str, Any]]:
     """Recent requests with the agents that handled each.
 
-    user_id scoping is applied in the WHERE clause, not filtered afterwards, so
-    a non-admin's query never loads another user's rows.
+    Scoping is a WHERE clause, not a post-filter, so a non-admin never loads another
+    user's rows.
     """
-    with get_pool().connection() as connection:
-        return connection.execute(
-            """
-            SELECT request.id,
-                   request.user_query,
-                   request.status,
-                   request.model_name,
-                   request.llm_calls,
-                   request.input_tokens,
-                   request.output_tokens,
-                   request.duration_ms,
-                   request.created_at,
-                   account.email AS user_email,
-                   COALESCE(
-                       ARRAY_AGG(invocation.agent_name ORDER BY invocation.sequence_index)
-                           FILTER (WHERE invocation.agent_name IS NOT NULL),
-                       '{}'
-                   ) AS agents
-            FROM plan_requests AS request
-            JOIN users AS account ON account.id = request.user_id
-            LEFT JOIN agent_invocations AS invocation ON invocation.request_id = request.id
-            WHERE (%s::uuid IS NULL OR request.user_id = %s::uuid)
-            GROUP BY request.id, account.email
-            ORDER BY request.created_at DESC
-            LIMIT %s
-            """,
-            (user_id, user_id, limit),
-        ).fetchall()
+    agents = func.coalesce(
+        func.array_agg(
+            aggregate_order_by(AgentInvocation.agent_name, AgentInvocation.sequence_index)
+        ).filter(AgentInvocation.agent_name.is_not(None)),
+        cast(literal("{}"), ARRAY(Text)),
+    ).label("agents")
+
+    statement = (
+        select(
+            PlanRequest.id,
+            PlanRequest.user_query,
+            PlanRequest.status,
+            PlanRequest.model_name,
+            PlanRequest.llm_calls,
+            PlanRequest.input_tokens,
+            PlanRequest.output_tokens,
+            PlanRequest.duration_ms,
+            PlanRequest.created_at,
+            User.email.label("user_email"),
+            agents,
+        )
+        .select_from(PlanRequest)
+        .join(User, User.id == PlanRequest.user_id)
+        .outerjoin(AgentInvocation, AgentInvocation.request_id == PlanRequest.id)
+        .group_by(PlanRequest.id, User.email)
+        .order_by(PlanRequest.created_at.desc())
+        .limit(limit)
+    )
+
+    if user_id is not None:
+        statement = statement.where(PlanRequest.user_id == user_id)
+
+    with session_scope() as session:
+        return [dict(row) for row in session.execute(statement).mappings()]
 
 
 def get_request(
     plan_id: uuid.UUID,
     user_id: uuid.UUID | None = None,
 ) -> dict[str, Any] | None:
-    with get_pool().connection() as connection:
-        request = connection.execute(
-            """
-            SELECT request.*, account.email AS user_email
-            FROM plan_requests AS request
-            JOIN users AS account ON account.id = request.user_id
-            WHERE request.id = %s
-              AND (%s::uuid IS NULL OR request.user_id = %s::uuid)
-            """,
-            (plan_id, user_id, user_id),
-        ).fetchone()
+    request_statement = (
+        select(*PlanRequest.__table__.c, User.email.label("user_email"))
+        .join_from(PlanRequest, User, User.id == PlanRequest.user_id)
+        .where(PlanRequest.id == plan_id)
+    )
 
-        if request is None:
+    if user_id is not None:
+        request_statement = request_statement.where(PlanRequest.user_id == user_id)
+
+    invocations_statement = (
+        select(
+            AgentInvocation.agent_name,
+            AgentInvocation.sequence_index,
+            AgentInvocation.status,
+            AgentInvocation.error_message,
+            AgentInvocation.llm_calls,
+            AgentInvocation.input_tokens,
+            AgentInvocation.output_tokens,
+            AgentInvocation.duration_ms,
+            AgentInvocation.output_summary,
+            AgentInvocation.started_at,
+            AgentInvocation.finished_at,
+        )
+        .where(AgentInvocation.request_id == plan_id)
+        .order_by(AgentInvocation.sequence_index)
+    )
+
+    with session_scope() as session:
+        row = session.execute(request_statement).mappings().one_or_none()
+        if row is None:
             return None
 
-        request["invocations"] = connection.execute(
-            """
-            SELECT agent_name, sequence_index, status, error_message,
-                   llm_calls, input_tokens, output_tokens, duration_ms,
-                   output_summary, started_at, finished_at
-            FROM agent_invocations
-            WHERE request_id = %s
-            ORDER BY sequence_index
-            """,
-            (plan_id,),
-        ).fetchall()
-
+        request = dict(row)
+        request["invocations"] = [
+            dict(invocation) for invocation in session.execute(invocations_statement).mappings()
+        ]
         return request
 
 
 def list_invocations(limit: int = 100) -> list[dict[str, Any]]:
     """Flat log view across all requests, newest first."""
-    with get_pool().connection() as connection:
-        return connection.execute(
-            """
-            SELECT invocation.agent_name,
-                   invocation.status,
-                   invocation.duration_ms,
-                   invocation.input_tokens,
-                   invocation.output_tokens,
-                   invocation.error_message,
-                   invocation.started_at,
-                   invocation.request_id,
-                   request.user_query
-            FROM agent_invocations AS invocation
-            JOIN plan_requests AS request ON request.id = invocation.request_id
-            ORDER BY invocation.started_at DESC
-            LIMIT %s
-            """,
-            (limit,),
-        ).fetchall()
+    statement = (
+        select(
+            AgentInvocation.agent_name,
+            AgentInvocation.status,
+            AgentInvocation.duration_ms,
+            AgentInvocation.input_tokens,
+            AgentInvocation.output_tokens,
+            AgentInvocation.error_message,
+            AgentInvocation.started_at,
+            AgentInvocation.request_id,
+            PlanRequest.user_query,
+        )
+        .join_from(AgentInvocation, PlanRequest, PlanRequest.id == AgentInvocation.request_id)
+        .order_by(AgentInvocation.started_at.desc())
+        .limit(limit)
+    )
+
+    with session_scope() as session:
+        return [dict(row) for row in session.execute(statement).mappings()]

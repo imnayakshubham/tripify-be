@@ -1,12 +1,5 @@
-"""Destination agent.
-
-Brief: "Must justify each suggestion against the stated preferences, and must
-never recommend a destination that breaks a hard constraint the user gave."
-
-The second half is enforced here in code. The prompt asks the model to flag
-violations, and this module then *filters those candidates out* before choosing —
-so a violating suggestion cannot reach the user even if the model emits one.
-"""
+"""Destination agent. Candidates the model flagged as breaking a hard constraint are
+filtered out here, so a flagged suggestion cannot reach the user."""
 
 from langchain_core.messages import AIMessage
 
@@ -44,10 +37,9 @@ def destination_agent(state: TravelState):
             )
 
     recommended = choice.get("recommended_destination", "")
-    viable_names = {candidate.get("destination", "") for candidate in viable}
 
     # The recommendation must itself be viable; fall back to the first that is.
-    if recommended not in viable_names:
+    if recommended not in {candidate.get("destination", "") for candidate in viable}:
         recommended = viable[0]["destination"] if viable else ""
 
     return {

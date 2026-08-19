@@ -1,9 +1,4 @@
-"""Synthesis prompt: fold the specialists into one coherent answer.
-
-The brief asks that the answer show which agents contributed, because
-transparency matters in a real tool — so the contributing agents are named in the
-prompt and the model is told to attribute.
-"""
+"""Synthesis prompt: fold the specialists into one coherent answer, naming them."""
 
 SYSTEM = (
     "You combine specialist agent outputs into one coherent travel answer. You "

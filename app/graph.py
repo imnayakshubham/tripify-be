@@ -1,11 +1,6 @@
-"""The orchestration layer.
-
-The supervisor decides which specialists a query needs; routing then chains them
-in dependency order and falls through to synthesis once the last selected agent
-has run. Destination feeds Itinerary feeds Budget, because each genuinely depends
-on the one before: you cannot plan days without a destination, and you cannot
-cost a plan that does not exist yet.
-"""
+"""Orchestration: the supervisor picks the specialists, routing chains them in
+dependency order and falls through to synthesis. Picking none ends the run — the
+supervisor has already answered."""
 
 from langgraph.graph import END, START, StateGraph
 
@@ -20,21 +15,17 @@ from app.configs import DATABASE_URL
 from app.db import build_checkpointer
 from app.schema import TravelState
 
-# Dependency order. Specialists run sequentially, never in parallel, because each
-# one reads what the previous wrote.
+# Sequential, never parallel — each agent reads what the last one wrote. You cannot
+# plan days without a destination, or cost a plan that does not exist.
 AGENT_ORDER = [
     "destination_agent",
     "itinerary_agent",
     "budget_agent",
 ]
 
-# Every hop either lands on the next selected specialist or on synthesis.
-ROUTE_MAP = {
-    "destination_agent": "destination_agent",
-    "itinerary_agent": "itinerary_agent",
-    "budget_agent": "budget_agent",
-    "synthesis": "synthesis",
-}
+# Every hop either lands on the next selected specialist or on synthesis. END is only
+# reachable from the supervisor, which answers directly when no specialist is needed.
+ROUTE_TARGETS = AGENT_ORDER + ["synthesis", END]
 
 
 def selected_agents_in_order(state: TravelState) -> list[str]:
@@ -44,8 +35,10 @@ def selected_agents_in_order(state: TravelState) -> list[str]:
 
 
 def route_from_supervisor(state: TravelState) -> str:
+    # No specialist means there is nothing to synthesise — the supervisor already wrote
+    # final_response, so ending here saves a pointless LLM call.
     selected_agents = selected_agents_in_order(state)
-    return selected_agents[0] if selected_agents else "synthesis"
+    return selected_agents[0] if selected_agents else END
 
 
 def route_after_agent(current_agent: str):
@@ -74,10 +67,10 @@ def build_graph():
     builder.add_node("synthesis", synthesis_agent)
 
     builder.add_edge(START, "supervisor")
-    builder.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_MAP)
+    builder.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_TARGETS)
 
     for agent_name in AGENT_ORDER:
-        builder.add_conditional_edges(agent_name, route_after_agent(agent_name), ROUTE_MAP)
+        builder.add_conditional_edges(agent_name, route_after_agent(agent_name), ROUTE_TARGETS)
 
     builder.add_edge("synthesis", END)
 

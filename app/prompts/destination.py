@@ -1,10 +1,7 @@
 """Destination agent prompt.
 
-Behavioural constraint from the brief: must justify each suggestion against the
-stated preferences, and must never recommend a destination that breaks a hard
-constraint. The justification is required per candidate, and the hard-constraint
-check is a machine-readable flag so the agent can enforce it in code rather than
-trusting the model to obey.
+`respects_hard_constraints` is a machine-readable flag so app/agents/destination.py
+can enforce the rule in code rather than trusting the model to obey it.
 """
 
 from typing import Any

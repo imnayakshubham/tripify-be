@@ -1,14 +1,7 @@
 """Itinerary agent.
 
-Brief: "Each day must be realistic on travel time and sequencing, and it must say
-so when it is uncertain." Both live in the prompt — unlike the destination and
-budget rules, this one is a judgement the model makes rather than a check code
-can verify.
-
-The model returns JSON (as the destination and budget agents already do) so the
-UI can render a real day-by-day plan. `_format` turns that back into markdown,
-which is what the synthesis agent reads; dropping it would quietly degrade the
-final answer.
+Realistic timing and stated uncertainty live in the prompt alone — no code can verify
+them. `_format` is load-bearing: synthesis reads only the markdown.
 """
 
 import logging
@@ -38,9 +31,8 @@ def itinerary_agent(state: TravelState):
         plan = parse_json_response(response)
         itinerary = _format(plan)
     except (ValueError, KeyError, TypeError):
-        # The model ignored the schema. Keep whatever it did say rather than
-        # failing the agent: the UI falls back to rendering this as markdown,
-        # so a bad parse costs the day-by-day view and nothing else.
+        # Keep the raw text rather than failing the agent — the UI renders it as
+        # markdown, so a bad parse costs the day-by-day view and nothing else.
         logger.warning("Itinerary JSON did not parse; falling back to raw text.")
         plan = {}
         itinerary = response
@@ -53,7 +45,6 @@ def itinerary_agent(state: TravelState):
 
 
 def _format(plan: dict) -> str:
-    """Render the structured plan as markdown, for the synthesis agent."""
     lines = []
 
     if plan.get("summary"):

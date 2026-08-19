@@ -1,12 +1,8 @@
 """HTTP endpoints over the orchestration layer.
 
-IMPORTANT: every route here is a sync `def`, never `async def`.
-
-Graph nodes are synchronous and blocking. FastAPI runs sync `def` routes in an
-anyio worker thread, which keeps the event loop free and gives each request its
-own thread — which is also what makes the ContextVar-based token accounting in
-app/agents/base.py correct. Converting these to `async def` would block the loop
-for the whole multi-agent run.
+Every route is a sync `def`, never `async def`. Graph nodes block, so FastAPI runs
+these on a worker thread — which is what makes the ContextVar token accounting in
+app/agents/base.py correct.
 """
 
 import json
@@ -45,6 +41,25 @@ def thread_config(plan_id: uuid.UUID) -> dict:
     return {"configurable": {"thread_id": str(plan_id)}}
 
 
+def elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def open_plan(request: CreatePlanRequest, user: CurrentUser) -> uuid.UUID:
+    """Continue the given plan, or start a new one. Reusing the id resumes its thread."""
+    if request.plan_id is not None:
+        return request.plan_id
+
+    plan_id = uuid.uuid4()
+    audit.start_request(
+        plan_id=plan_id,
+        user_id=user.id,
+        user_query=request.user_query,
+        model_name=MODEL_NAME,
+    )
+    return plan_id
+
+
 @router.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -55,15 +70,7 @@ def create_plan(
     request: CreatePlanRequest,
     user: CurrentUser = Depends(current_user),
 ) -> PlanResponse:
-    """Route across the agents and return one synthesised answer."""
-    plan_id = uuid.uuid4()
-
-    audit.start_request(
-        plan_id=plan_id,
-        user_id=user.id,
-        user_query=request.user_query,
-        model_name=MODEL_NAME,
-    )
+    plan_id = open_plan(request, user)
 
     started = time.monotonic()
 
@@ -82,7 +89,7 @@ def create_plan(
             plan_id=plan_id,
             status="failed",
             error_message=f"{type(error).__name__}: {error}",
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=elapsed_ms(started),
         )
         logger.exception("Plan %s failed", plan_id)
         raise HTTPException(status_code=500, detail="The planning run failed.") from error
@@ -91,7 +98,7 @@ def create_plan(
         plan_id=plan_id,
         status="completed",
         trip_constraints=result.get("trip_constraints"),
-        duration_ms=int((time.monotonic() - started) * 1000),
+        duration_ms=elapsed_ms(started),
     )
 
     return _plan_response(plan_id, result, user)
@@ -108,14 +115,13 @@ def _plan_response(plan_id: uuid.UUID, result: dict, user: CurrentUser) -> PlanR
         itinerary=result.get("itinerary", ""),
         budget_results=result.get("budget_results", ""),
         trip_constraints=result.get("trip_constraints", {}) or {},
-        # None rather than {} so the client can tell "this agent did not run"
-        # apart from "it ran and found nothing".
+        # None rather than {}: "did not run" is distinct from "ran and found nothing".
         destination_choice=result.get("destination_choice") or None,
         itinerary_plan=result.get("itinerary_plan") or None,
         budget_assessment=result.get("budget_assessment") or None,
     )
 
-    # Cost and per-agent timing are admin-only — one of the two role differences.
+    # Cost and per-agent timing are admin-only.
     if user.is_admin:
         detail = audit.get_request(plan_id) or {}
         response.llm_calls = detail.get("llm_calls")
@@ -142,11 +148,7 @@ def _sse(event: str, data: dict) -> str:
 
 
 def _agent_status(delta: dict, agent_name: str) -> str:
-    """Read the real outcome off the delta rather than inventing one.
-
-    `@audited` appends either "<name>" or "<name> (failed)" to
-    contributing_agents, so the failure marker is already in the state.
-    """
+    """Read the outcome off the "(failed)" suffix @audited wrote, rather than inventing one."""
     labels = delta.get("contributing_agents") or []
     return "failed" if f"{agent_name} (failed)" in labels else "succeeded"
 
@@ -158,24 +160,12 @@ def create_plan_stream(
 ) -> StreamingResponse:
     """The same run as POST /plans, emitting each agent as it lands.
 
-    POST /plans stays the simple blocking path. This one exists so the UI can
-    show real progress instead of a spinner: the supervisor's update carries
-    `selected_agents`, so as soon as it arrives the client knows exactly which
-    specialists will run and in what order.
-
-    Sync `def` with a sync generator, for the reason in the module docstring.
-    The ContextVar token accounting in app/agents/base.py is unaffected: it is
-    set and reset inside a single agent call, and a node runs start to finish
-    within one `next()` on this generator, so the pair never straddles a yield.
+    The supervisor's update carries `selected_agents`, so the client knows the real
+    chain from the first event. The generator is safe for the ContextVar accounting in
+    app/agents/base.py: a node runs start to finish within one `next()`, so set/reset
+    never straddle a yield.
     """
-    plan_id = uuid.uuid4()
-
-    audit.start_request(
-        plan_id=plan_id,
-        user_id=user.id,
-        user_query=request.user_query,
-        model_name=MODEL_NAME,
-    )
+    plan_id = open_plan(request, user)
 
     def event_stream() -> Iterator[str]:
         started = time.monotonic()
@@ -196,8 +186,7 @@ def create_plan_stream(
                 config=thread_config(plan_id),
                 stream_mode=["updates", "values"],
             ):
-                # "values" carries the whole state; keep the last one so the
-                # final payload is built exactly like the blocking route's.
+                # "values" carries the whole state; the last one builds the payload.
                 if mode == "values":
                     final_state = chunk
                     continue
@@ -211,8 +200,8 @@ def create_plan_stream(
                         yield _sse(
                             "routed",
                             {
-                                # Same helper the graph routes with, so the
-                                # client's pipeline matches what actually runs.
+                                # The helper the graph routes with, so the client's
+                                # pipeline matches what actually runs.
                                 "selected_agents": selected_agents_in_order(delta),
                                 "supervisor_reasoning": delta.get("supervisor_reasoning", ""),
                             },
@@ -231,21 +220,20 @@ def create_plan_stream(
                 plan_id=plan_id,
                 status="completed",
                 trip_constraints=final_state.get("trip_constraints"),
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=elapsed_ms(started),
             )
             closed = True
 
-            # After finish_request, so the admin cost rollup it reads is final.
+            # After finish_request, so the admin cost rollup is final.
             yield _sse("done", _plan_response(plan_id, final_state, user).model_dump(mode="json"))
 
         except Exception as error:
-            # The 200 and headers are already sent, so a failure here cannot be
-            # an HTTP status. It has to travel as an event.
+            # Headers are already sent, so failure travels as an event, not a status.
             audit.finish_request(
                 plan_id=plan_id,
                 status="failed",
                 error_message=f"{type(error).__name__}: {error}",
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=elapsed_ms(started),
             )
             closed = True
             logger.exception("Plan %s failed", plan_id)
@@ -253,13 +241,13 @@ def create_plan_stream(
 
         finally:
             if not closed:
-                # The client went away mid-run and GeneratorExit unwound us.
-                # Close the row rather than strand it in 'running' forever.
+                # GeneratorExit: the client went away. Close the row rather than
+                # strand it in 'running'.
                 audit.finish_request(
                     plan_id=plan_id,
                     status="failed",
                     error_message="The client disconnected before the run finished.",
-                    duration_ms=int((time.monotonic() - started) * 1000),
+                    duration_ms=elapsed_ms(started),
                 )
 
     return StreamingResponse(
@@ -274,17 +262,13 @@ def get_plan_result(
     plan_id: uuid.UUID,
     user: CurrentUser = Depends(current_user),
 ) -> PlanResponse:
-    """Re-open a finished plan.
+    """Re-open a finished plan from the LangGraph checkpoint.
 
-    The answer was never duplicated into the audit tables — it lives in the
-    LangGraph checkpoint, which is reachable because `plan_requests.id` *is* the
-    thread id. So history is replayed from the checkpoint rather than from a
-    second copy that could drift out of step with it.
-
-    Runs no agents and makes no LLM calls.
+    The answer lives in the checkpoint, reachable because `plan_requests.id` *is* the
+    thread id. No second copy to drift.
     """
-    # Ownership first: non-admins are scoped by the audit row, so this cannot be
-    # used to read someone else's thread by guessing an id.
+    # Ownership first — the checkpoint tables carry no user_id, so a guessed id
+    # would otherwise read someone else's thread.
     if audit.get_request(plan_id, user_id=None if user.is_admin else user.id) is None:
         raise HTTPException(status_code=404, detail=f"No plan '{plan_id}'.")
 
@@ -310,7 +294,7 @@ def get_plan(
     plan_id: uuid.UUID,
     user: CurrentUser = Depends(current_user),
 ) -> AuditRequestDetail:
-    """Read a stored plan. Runs no agents and makes no LLM calls."""
+    """Read a stored plan's audit record."""
     detail = audit.get_request(plan_id, user_id=None if user.is_admin else user.id)
 
     if detail is None:

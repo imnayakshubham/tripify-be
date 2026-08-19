@@ -1,5 +1,3 @@
-"""Environment values. No factories live here — see app/llms and app/db for those."""
-
 import os
 
 from dotenv import load_dotenv
@@ -11,10 +9,10 @@ IS_PROD = ENV == "PROD"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-20b")
 
 ALLOWED_CORS_ORIGINS = [
     origin.strip()
-    for origin in os.getenv( "CORS_ORIGINS").split(",")
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]

@@ -1,8 +1,6 @@
 """Shared plumbing: LLM calls, token accounting, and the audit decorator.
 
-Imports only from app.llms, app.db and app.schema — never from app.agents, which
-would be circular (app/agents/__init__ imports every agent module, and each of
-those imports from here).
+Never import from app.agents here — that would be circular.
 """
 
 from __future__ import annotations
@@ -50,8 +48,7 @@ def ask_llm(system_message: str, user_prompt: str) -> str:
 
     usage = _usage.get(None)
     if usage is not None:
-        # ChatGroq populates usage_metadata from the provider response, so these
-        # are measured counts rather than an estimate.
+        # Measured counts from the provider, not an estimate.
         metadata = getattr(response, "usage_metadata", None) or {}
         usage["llm_calls"] += 1
         usage["input_tokens"] += metadata.get("input_tokens", 0)
@@ -78,24 +75,20 @@ _CURRENCY_ALIASES = {
 
 
 def normalise_currency(value: Any) -> str | None:
-    """Map a currency written any which way onto an ISO code.
+    """Map a currency written any which way ("pounds", "GBP", "£") onto an ISO code.
 
-    The supervisor extracts the user's own wording ("pounds") while the budget
-    agent returns a code ("GBP"). Comparing those raw strings once reported a
-    real overage as unverifiable, so both sides are normalised before any
-    comparison. Returns None when the value is not recognised — callers must
-    treat that as "unknown", never as "different".
+    Returns None for anything unrecognised — callers must read that as unknown,
+    never as different.
     """
     text = str(value or "").strip().lower()
     return _CURRENCY_ALIASES.get(text)
 
 
 def to_number(value: Any) -> float | None:
-    """Coerce a model-supplied number that may be '£1,200' or '1200 GBP' or 1200.
+    """Coerce a model-supplied number: '£1,200', '1200 GBP', 1200.
 
-    Mirrors `toNumber` in trip-planner-fe/src/lib/trip.ts. The two must agree:
-    if the client parses a figure the server could not, it can reach a different
-    verdict from the server on identical data.
+    Mirrors `toNumber` in trip-planner-fe/src/lib/trip.ts — the two must agree or
+    client and server reach different verdicts on identical data.
     """
     if isinstance(value, bool):
         return None
@@ -114,9 +107,8 @@ def to_number(value: Any) -> float | None:
 def audited(agent_name: str) -> Callable:
     """Time an agent, record it in the audit trail, and attribute it.
 
-    Attribution and audit are produced here, in one place, so they cannot drift
-    apart. A failing agent is recorded and the chain continues with an empty
-    result rather than the whole request returning a 500.
+    One place, so attribution and audit cannot drift. A failing agent is recorded and
+    the chain continues rather than the request returning a 500.
     """
 
     def decorator(agent_fn: Callable[[TravelState], dict]) -> Callable:
