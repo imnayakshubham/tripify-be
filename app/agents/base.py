@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable
 
+from groq import RateLimitError
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.db import audit
@@ -28,6 +29,10 @@ llm = get_llm()
 # FastAPI runs each sync request in its own worker thread.
 _usage: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar("agent_usage")
 
+# A full run costs roughly 5k tokens against a 8000/minute quota, so a second run started
+# inside the same minute has to wait for the window rather than fail.
+RATE_LIMIT_ATTEMPTS = 5
+
 AGENT_SEQUENCE = {
     "supervisor": 0,
     "destination_agent": 1,
@@ -37,9 +42,35 @@ AGENT_SEQUENCE = {
 }
 
 
+def _invoke_with_retry(messages: list) -> Any:
+    """Wait out a drained quota: one run makes five calls against a per-minute budget.
+
+    Only 429 is worth retrying. Groq's other rate-limit status, 413, means the request
+    reserves more tokens than the whole quota — deterministic, so retrying it unchanged
+    just fails again more slowly.
+    """
+    for attempt in range(RATE_LIMIT_ATTEMPTS):
+        try:
+            return llm.invoke(messages)
+        except RateLimitError as error:
+            if attempt == RATE_LIMIT_ATTEMPTS - 1:
+                raise
+
+            # Groq's retry-after is how long the rolling window needs to drain, so honour
+            # it rather than a backoff curve that gives up while the quota is still full.
+            header = (error.response.headers.get("retry-after") if error.response else None) or ""
+            try:
+                pause = float(header)
+            except ValueError:
+                pause = float(2**attempt)
+
+            logger.warning("Rate limited by Groq; retrying in %.1fs.", pause)
+            time.sleep(min(pause, 30.0))
+
+
 def ask_llm(system_message: str, user_prompt: str) -> str:
     """One-shot LLM call, recording the provider's real token counts."""
-    response = llm.invoke(
+    response = _invoke_with_retry(
         [
             SystemMessage(content=system_message),
             HumanMessage(content=user_prompt),
