@@ -11,7 +11,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-20b")
 
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "16384"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))
 
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "").strip() or None
 
