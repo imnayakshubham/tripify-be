@@ -10,7 +10,12 @@ from app.db.models import Base
 
 config = context.config
 
-if config.config_file_name is not None:
+# Only when the alembic CLI is driving. app.db.migrate hands in a connection from inside
+# the running server, where fileConfig would take over the whole process's logging: it
+# disables every logger it does not name — including uvicorn's, which is what silently
+# ate the "Application startup failed" traceback — and repoints root at alembic.ini's
+# WARNING console handler, muting the app.
+if config.config_file_name is not None and config.attributes.get("connection") is None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

@@ -14,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    run_migrations()
+    try:
+        run_migrations()
+    except Exception:
+        logger.exception("Migrations failed; starting anyway so /health and this log stay reachable.")
 
     logger.info("Starting in %s, allowing origins: %s", ENV, ALLOWED_CORS_ORIGINS or "(none)")
 
